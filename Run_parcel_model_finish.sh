@@ -1,168 +1,125 @@
 #!/bin/bash
-#SBATCH -N 1                        # 1 node
-#SBATCH -q debug                    # debug queue (change to regular later)
-#SBATCH -t 00:30:00                 # time limit
-#SBATCH -J parcel                   # job name
-#SBATCH -A m4334                    # allocation
+#SBATCH -N 1
+#SBATCH -q debug
+#SBATCH -t 00:30:00
+#SBATCH -J parcel
+#SBATCH -A m4334
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=liranp@uci.edu
 #SBATCH -L scratch,cfs
-#SBATCH -C cpu                      # CPU nodes only
-#SBATCH --ntasks=128                # 128 parallel tasks (1 per CPU core)
+#SBATCH -C cpu
+#SBATCH --ntasks=128
 
 module load python
-module load scipy-stack   # or conda activate your env
+module load scipy-stack
 
-# ✅ Write the inline ParcelModel code to a file
+# ✅ Fully self-contained parcel model with Ghan supersaturation equations
 cat << 'EOF' > parcel_model_run.py
+import os, math
 import numpy as np
-from scipy.optimize import bisect
+import pandas as pd
 from scipy.integrate import odeint
+from scipy.optimize import bisect
 
-#######################################
-# === CONSTANTS ===
-#######################################
-g       = 9.81        # gravity [m/s2]
-R       = 8.314       # universal gas constant [J/mol/K]
-Rd      = 287.058     # gas constant for dry air [J/kg/K]
-Cp      = 1004.0      # specific heat of air [J/kg/K]
-L       = 2.5e6       # latent heat of vaporization [J/kg]
-rho_w   = 1000.0      # density of water [kg/m3]
-epsilon = 0.622       # ratio of gas constants (Rd/Rv)
-Mw      = 0.018015    # molar mass of water [kg/mol]
-Ma      = 0.02897     # molar mass of dry air [kg/mol]
-STATE_VAR_MAP = {"z":0,"P":1,"T":2,"wv":3,"wc":4,"wi":5,"S":6}
-N_STATE_VARS = 7
+############################################
+# 1️⃣ CONSTANTS
+############################################
+g = 9.81
+Cp = 1004.0
+L = 2.5e6        # latent heat of vaporization [J/kg]
+rho_w = 1000.0
+R = 8.314
+Mw = 18.0 / 1000.0   # kg/mol
+Ma = 28.9 / 1000.0
+Rd = R / Ma
+Rv = R / Mw
+Dv = 2.5e-5       # diffusivity of water vapor [m2/s]
+Ka = 2.4e-2       # thermal conductivity of air [J/m/s/K]
+ac = 1.0          # condensation coefficient
+epsilon = 0.622
 
-#######################################
-# === SUPPORTING CLASSES ===
-#######################################
+STATE_VARS = ["z", "P", "T", "wv", "wc", "wi", "S"]
+STATE_VAR_MAP = {var: i for i, var in enumerate(STATE_VARS)}
+
+############################################
+# 2️⃣ SUPPORT FUNCTIONS
+############################################
+def es(T_c):
+    """Saturation vapor pressure over water [Pa], T in °C."""
+    return 610.94 * math.exp(17.625 * T_c / (T_c + 243.04))
+
+def rho_air(T, P):
+    return P / (Rd * T)
+
+def Seq(r, r_dry, T, kappa):
+    """Köhler equilibrium supersaturation."""
+    sigma = 0.072
+    A = 2 * sigma * Mw / (R * T * rho_w)
+    B = kappa * r_dry**3
+    return math.exp(A/r - B/(r**3)) - 1
+
+def kohler_crit(T, r_dry, kappa):
+    """Critical Köhler radius & supersat."""
+    sigma = 0.072
+    A = 2 * sigma * Mw / (R * T * rho_w)
+    B = kappa * r_dry**3
+    r_crit = math.sqrt(3*B/A)
+    S_crit = math.exp(4*A/(27*B)) - 1
+    return r_crit, S_crit
+
+def condensational_growth_rate(r, T, S, P):
+    """
+    Compute dr/dt for a single droplet (Ghan eqns).
+    """
+    # saturation vapor pressure
+    e_s = es(T-273.15)
+    rho_a = rho_air(T, P)
+
+    # terms for mass transfer
+    G_v = (Rv * T) / (Dv * e_s)
+    G_t = (L * Mw) / (Ka * R * T) * (L / (R * T) - 1)
+    G = 1.0 / (rho_w * (G_v + G_t))
+
+    # supersaturation driven growth (eq. 9)
+    drdt = (G / r) * S
+    return drdt
+
+############################################
+# 3️⃣ DISTRIBUTIONS & AEROSOLS
+############################################
 class Lognorm:
-    """Simple lognormal aerosol distribution placeholder."""
-    def __init__(self, mu, sigma, N):
+    def __init__(self, mu, sigma, N=1.0):
         self.mu = mu
         self.sigma = sigma
         self.N = N
+    def pdf(self, x):
+        scaling = self.N / (np.sqrt(2.0 * np.pi) * np.log(self.sigma))
+        exponent = ((np.log(x / self.mu)) ** 2) / (2.0 * (np.log(self.sigma)) ** 2)
+        return (scaling / x) * np.exp(-exponent)
 
 class AerosolSpecies:
-    """Minimal aerosol species class for parcel model."""
-    def __init__(self, species, distribution, bins=200, kappa=0.54):
+    def __init__(self, species, distribution, kappa, bins=50):
         self.species = species
+        self.distribution = distribution
         self.kappa = kappa
         self.bins = bins
-        self.mu = distribution.mu
-        self.sigma = distribution.sigma
-        self.N = distribution.N
-        # dry radius bins (log spaced)
-        self.r_drys = np.logspace(np.log10(self.mu/2), np.log10(self.mu*2), bins)
-        # assume equal number per bin for simplicity
-        self.Nis = np.ones(bins) * (self.N / bins)
-        self.nr = bins
 
-#######################################
-# === PHYSICS HELPERS ===
-#######################################
-def es(Tc):
-    """Saturation vapor pressure over liquid water [Pa]. Tc in Celsius."""
-    return 610.94 * np.exp(17.625*Tc/(Tc+243.04))
+        # log-spaced bins
+        lr = np.log10(distribution.mu / (10.0 * distribution.sigma))
+        rr = np.log10(distribution.mu * 10.0 * distribution.sigma)
+        self.rs = np.logspace(lr, rr, num=bins + 1)
+        mids = np.array([np.sqrt(a * b) for a, b in zip(self.rs[:-1], self.rs[1:])])
+        self.r_drys = mids * 1e-6
+        self.Nis = np.array(
+            [0.5 * (b - a) * (distribution.pdf(a) + distribution.pdf(b))
+             for a, b in zip(self.rs[:-1], self.rs[1:])]
+        ) * 1e6
+        self.N = np.sum(self.Nis)
 
-def rho_air(T, P, wv):
-    """Air density accounting for humidity."""
-    Tv = (1.0 + 0.61*wv) * T
-    return P / (Rd * Tv)
-
-def Seq(r, r_dry, T, kappa):
-    """Equilibrium supersaturation over droplet."""
-    return (1 + kappa * (r_dry/r)**3) * np.exp((2*0.072)/(rho_w*R*T*r*1e6)) - 1.0
-
-def kohler_crit(T, r_dry, kappa):
-    """Köhler critical radius and supersaturation (simplified placeholder)."""
-    Scrit = 0.01  # dummy value
-    rcrit = r_dry * (1 + kappa)**(1/3)
-    return rcrit, Scrit
-
-def dv(T, r, P, accom):
-    """Vapor diffusivity [m2/s] placeholder."""
-    return 2.26e-5
-
-def ka(T, rho_air, r):
-    """Thermal conductivity [W/m/K] placeholder."""
-    return 2.4e-2
-
-#######################################
-# === ODE SYSTEM ===
-#######################################
-def parcel_ode_sys(y, t, nr, r_drys, Nis, V, kappas, accom=1.0):
-    """
-    Calculates time derivatives of parcel state variables.
-    y[0:7] = z, P, T, wv, wc, wi, S
-    y[7:]  = aerosol radii
-    """
-    z, P, T, wv, wc, wi, S = y[0:7]
-    rs = np.asarray(y[N_STATE_VARS:])
-
-    # Thermodynamics
-    T_c = T - 273.15
-    pv_sat = es(T_c)
-    Tv = (1.0 + 0.61*wv) * T
-    e = (1.0 + S) * pv_sat
-    rho = P / (Rd * Tv)
-    rho_dry = (P - e) / (Rd * T)
-
-    # 1) Pressure
-    dP_dt = -rho * g * V
-
-    # 2) Droplet growth
-    drs_dt = np.zeros(nr)
-    dwc_dt = 0.0
-    for i in range(nr):
-        r = rs[i]
-        r_dry = r_drys[i]
-        kappa = kappas[i]
-        # simplified growth rate
-        G = 1.0
-        delta_S = S - Seq(r, r_dry, T, kappa)
-        dr_dt = (G/r) * delta_S
-        Ni = Nis[i]
-        dwc_dt += Ni * (r*r) * dr_dt
-        drs_dt[i] = dr_dt
-
-    dwc_dt *= 4.0 * np.pi * rho_w / rho_dry
-
-    # 3) Ice water (not used here)
-    dwi_dt = 0.0
-
-    # 4) Water vapor
-    dwv_dt = - (dwc_dt + dwi_dt)
-
-    # 5) Temperature
-    dT_dt = -g*V/Cp - L*dwv_dt/Cp
-
-    # 6) Supersaturation
-    alpha = (g*Mw*L)/(Cp*R*(T**2)) - (g*Ma)/(R*T)
-    gamma = (P*Ma)/(Mw*es(T_c)) + (Mw*L*L)/(Cp*R*T*T)
-    dS_dt = alpha*V - gamma*dwc_dt
-
-    dz_dt = V
-
-    dydt = np.zeros(nr + N_STATE_VARS)
-    dydt[0] = dz_dt
-    dydt[1] = dP_dt
-    dydt[2] = dT_dt
-    dydt[3] = dwv_dt
-    dydt[4] = dwc_dt
-    dydt[5] = dwi_dt
-    dydt[6] = dS_dt
-    dydt[N_STATE_VARS:] = drs_dt[:]
-    return dydt
-
-#######################################
-# === PARCEL MODEL CLASS ===
-#######################################
+############################################
+# 4️⃣ PARCEL MODEL with GHAN dS/dt
+############################################
 class ParcelModel:
-    """
-    Simplified Parcel Model stripped to essentials.
-    """
     def __init__(self, aerosols, V, T0, S0, P0):
         self.aerosols = aerosols
         self.V = V
@@ -172,74 +129,109 @@ class ParcelModel:
         self._setup_run()
 
     def _setup_run(self):
-        r_drys, kappas, Nis = [], [], []
+        """Set up equilibrium droplet radii and state vector."""
+        self.z0 = 0.0
+        self.wv0 = (self.S0 + 1.0) * (epsilon * es(self.T0 - 273.15) / (self.P0 - es(self.T0 - 273.15)))
+        self.wc0 = 0.0
+        self.wi0 = 0.0
+
+        self._r0s = []
+        self._r_drys = []
+        self._Nis = []
+        self._kappas = []
+
         for aerosol in self.aerosols:
-            r_drys.extend(aerosol.r_drys)
-            kappas.extend([aerosol.kappa]*aerosol.nr)
-            Nis.extend(aerosol.Nis)
+            for r_dry, Ni in zip(aerosol.r_drys, aerosol.Nis):
+                r_b, _ = kohler_crit(self.T0, r_dry, aerosol.kappa)
+                f = lambda r: Seq(r, r_dry, self.T0, aerosol.kappa) - self.S0
+                r0 = bisect(f, r_dry, r_b, xtol=1e-30, maxiter=500)
+                self._r0s.append(r0)
+                self._r_drys.append(r_dry)
+                self._Nis.append(Ni)
+                self._kappas.append(aerosol.kappa)
 
-        self._r_drys = np.array(r_drys)
-        self._kappas = np.array(kappas)
-        self._Nis = np.array(Nis)
-        self._nr = len(r_drys)
+        self._r0s = np.array(self._r0s)
+        self._r_drys = np.array(self._r_drys)
+        self._Nis = np.array(self._Nis)
+        self._kappas = np.array(self._kappas)
 
-        # Initial state vector
-        T0, S0, P0 = self.T0, self.S0, self.P0
-        wv0 = (S0 + 1.0) * (epsilon * es(T0-273.15) / (P0 - es(T0-273.15)))
-        wc0 = 0.0
-        wi0 = 0.0
-        r0s = np.array(self._r_drys)
-        y0 = np.concatenate(([0.0, P0, T0, wv0, wc0, wi0, S0], r0s))
-        self.y0 = y0
+        self.y0 = np.concatenate(([self.z0, self.P0, self.T0,
+                                   self.wv0, self.wc0, self.wi0, self.S0],
+                                  self._r0s))
 
-    def run(self, t_end, output_dt=1.0):
-        t_grid = np.arange(0, t_end, output_dt)
-        y_out = odeint(parcel_ode_sys, self.y0, t_grid,
-                       args=(self._nr, self._r_drys, self._Nis, self.V, self._kappas))
-        return t_grid, y_out
+    def _rhs(self, y, t):
+        """Right-hand side ODE with Ghan dS/dt."""
+        z, P, T, wv, wc, wi, S = y[:7]
+        radii = y[7:]
 
-#######################################
-# === MAIN EXECUTION ===
-#######################################
-if __name__ == "__main__":
-    import os
-    rank = int(os.environ.get("SLURM_PROCID", 0))  # MPI task index
-    np.random.seed(rank)
-    N_samples = 150
+        # eq. 8: supersat tendency components
+        rho_a = rho_air(T, P)
+        alpha = (g * Mw * L) / (Cp * R * T**2) - (g * Ma) / (R * T)  # cooling term
+        beta = (Rv * T) / (Dv * es(T-273.15)) + (L * Mw) / (Ka * R * T) * (L/(R*T)-1)
+        G = 1.0 / (rho_w * beta)
 
-    all_results = []
-    for i in range(N_samples):
-        # Random initial conditions
-        P0 = np.random.uniform(70000, 90000)   # Pa
-        T0 = np.random.uniform(270, 290)       # K
-        S0 = np.random.uniform(-0.05, 0.05)    # supersaturation
-        V  = np.random.uniform(0.1, 2.0)       # updraft [m/s]
-        mu = np.random.uniform(0.01, 0.03)     # microns
-        sigma = np.random.uniform(1.4, 1.8)
-        N = np.random.uniform(500, 1500)       # cm^-3
+        # compute droplet growth (eq. 9-11)
+        drdt_all = []
+        condensational_sink = 0.0
 
-        aerosol = AerosolSpecies("sulfate", Lognorm(mu, sigma, N))
-        model = ParcelModel([aerosol], V, T0, S0, P0)
-        t, y = model.run(300, output_dt=1.0)
-        S_profile = y[:,6]  # supersaturation time series
-        all_results.append(S_profile)
+        for i, r in enumerate(radii):
+            drdt = (G / r) * S
+            drdt_all.append(drdt)
+            condensational_sink += self._Nis[i] * r * drdt
 
-    all_results = np.array(all_results)
-    np.save(f"parcel_task_{rank}.npy", all_results)
+        # eq. 8: supersaturation tendency
+        dSdt = alpha * self.V - (Mw/(rho_a*Rv*T)) * condensational_sink
+
+        # other tendencies (simplified for now)
+        dzdt = self.V
+        dPdt = -rho_a * g * self.V
+        dTdt = -g/Cp * self.V
+
+        return [dzdt, dPdt, dTdt, 0, 0, 0, dSdt] + drdt_all
+
+    def run(self, t_end=60.0, output_dt=1.0):
+        t = np.arange(0, t_end + output_dt, output_dt)
+        sol = odeint(self._rhs, self.y0, t)
+        out = pd.DataFrame(sol[:, :7], columns=STATE_VARS)
+        return out
+
+############################################
+# 5️⃣ PARALLEL EXECUTION
+############################################
+rank = int(os.environ.get("SLURM_PROCID", 0))
+np.random.seed(rank)
+
+N_samples = 150
+all_inputs = []
+all_outputs = []
+
+for i in range(N_samples):
+    # 🎲 Random ICs
+    P0 = np.random.uniform(70000, 90000)
+    T0 = np.random.uniform(270, 290)
+    S0 = np.random.uniform(-0.05, 0.05)
+    V  = np.random.uniform(0.1, 2.0)
+    mu = np.random.uniform(0.01, 0.03)
+    sigma = np.random.uniform(1.4, 1.8)
+    N = np.random.uniform(500, 1500)
+
+    sulfate = AerosolSpecies('sulfate', Lognorm(mu=mu, sigma=sigma, N=N), kappa=0.54, bins=50)
+    model = ParcelModel([sulfate], V, T0, S0, P0)
+
+    try:
+        par_out = model.run(t_end=60.0, output_dt=1.0)
+    except Exception as e:
+        print(f"[Rank {rank}] Simulation {i} failed: {e}")
+        continue
+
+    all_inputs.append({'P0': P0, 'T0': T0, 'S0': S0, 'V': V,
+                       'mu': mu, 'sigma': sigma, 'N': N})
+    all_outputs.append(par_out.to_dict(orient='list'))
+
+np.savez_compressed(f"parcel_results_rank{rank}.npz",
+                    inputs=all_inputs,
+                    outputs=all_outputs)
 EOF
 
-# ✅ Launch 128 Python tasks (one per CPU core)
+# ✅ Run across 128 cores
 srun -n 128 python parcel_model_run.py
-
-# ✅ Merge outputs on task 0 after finishing
-if [[ $SLURM_PROCID -eq 0 ]]; then
-python << 'PYEOF'
-import numpy as np, glob
-files = sorted(glob.glob("parcel_task_*.npy"))
-all_data = [np.load(f) for f in files]
-combined = np.concatenate(all_data, axis=0)
-np.save("parcel_all.npy", combined)
-print("✅ Combined dataset saved. Shape:", combined.shape)
-PYEOF
-fi
-
