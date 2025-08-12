@@ -1,0 +1,15 @@
+{
+  "npz_path": "/pscratch/sd/h/heroplr/Parcel_model/Standalone/parcel_array_20250809_211021/combined_outputs.npz",
+  "hidden": 256,
+  "depth": 5,
+  "epochs": 1000,
+  "lr": 0.0003,
+  "n_colloc": 128,
+  "accom_val": 0.3,
+  "print_every": 50,
+  "W_PHYS": 1.0,
+  "W_IC": 10.0,
+  "W_DATA": 0.2,
+  "model_out": "pinn_ddp.pt",
+  "preds_out": "pinn_preds_all.npz"
+}
