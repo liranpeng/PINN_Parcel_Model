@@ -1,15 +1,38 @@
 {
-  "npz_path": "/pscratch/sd/h/heroplr/Parcel_model/Standalone/parcel_array_20250809_211021/combined_outputs.npz",
+  "npz_path": "/pscratch/sd/h/heroplr/Parcel_model/Standalone/parcel_array_20250813_004233/combined_outputs.npz",
+  "model_out": "pinn.parcel.pt",
+  "preds_out": "pinn_preds.npz",
+
   "hidden": 256,
   "depth": 5,
-  "epochs": 1000,
-  "lr": 0.0003,
+  "lr": 0.00001,
+  "epochs": 100,
   "n_colloc": 128,
+
+  "W_PHYS": 4.0,
+  "W_IC": 0.1,
+  "W_DATA": 1.0,
   "accom_val": 0.3,
-  "print_every": 50,
-  "W_PHYS": 1.0,
-  "W_IC": 10.0,
-  "W_DATA": 0.2,
-  "model_out": "pinn_ddp.pt",
-  "preds_out": "pinn_preds_all.npz"
+  "kappa_val": 0.54,
+
+  "samples_per_epoch": 3200,
+  "reshuffle_across_ranks": true,
+  "print_every": 1,
+
+  "sup_points": 96,
+  "edge_supervision_frac": 0.30,
+  "ic_auto_balance": true,
+
+  "use_scheduler": 1,
+  "lr_factor": 0.5,
+  "lr_patience": 8,
+  "min_lr": 1e-7,
+
+  "clip_grad_norm": 0.5,
+  "ema_decay": 0.999,
+  "use_ema_for_eval": 1,
+
+  "ckpt_dir": "checkpoints",
+  "save_every": 20,
+  "run_inference": 1
 }
