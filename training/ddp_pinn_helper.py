@@ -1,14 +1,15 @@
 # ddp_pinn_helper.py
-import os, warnings
-import numpy as np
-from typing import Dict, Any, Tuple, Optional
-import time
+import os, warnings, time
 import datetime as dt
+from typing import Dict, Any, Tuple, Optional
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.autograd import grad
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 # ============================================================
 # Global config (float32 for DDP speed & consistency)
@@ -29,16 +30,19 @@ r_ref  = 1e-6
 # ===============================
 # Thermo / microphysics constants
 # ===============================
-PI   = np.pi
-g    = 9.81
-Cp   = 1004.0
-L    = 2.25e6
-rho_w= 1e3
-R    = 8.314
-Mw   = 18.0 / 1e3
-Ma   = 28.9 / 1e3
-Rd   = R / Ma
+PI    = np.pi
+g     = 9.81
+Cp    = 1004.0
+L     = 2.25e6
+rho_w = 1e3
+R     = 8.314
+Mw    = 18.0 / 1e3   # kg/mol
+Ma    = 28.9 / 1e3   # kg/mol
+Rd    = R / Ma
 
+# ===============================
+# Utility
+# ===============================
 def to_t(x):
     return torch.as_tensor(x, dtype=DTYPE)
 
@@ -64,7 +68,7 @@ def rho_air_dry(P, T):
     return P / (Rd * T)
 
 # ===============================
-# PINN model (concat conditioning inputs)
+# PINN model
 # ===============================
 class ResidualBlock(nn.Module):
     def __init__(self, dim:int):
@@ -155,14 +159,8 @@ def build_cond_vector_nd(ic: Dict[str, torch.Tensor],
                          device: torch.device) -> torch.Tensor:
     """
     Normalized conditioning vector (shape: (1,8)), ~O(1) scales:
-      [S0/S_ref,
-       (T0-T_ref)/dT_ref,
-       (P0-P_ref)/(dT_ref*1000),
-       wv0/wv_ref,
-       wc0/wc_ref,
-       log10(sum(Ni)),
-       mean(r_dry)/1e-6,
-       mean(kappa)]
+      [S0/S_ref, (T0-T_ref)/dT_ref, (P0-P_ref)/(dT_ref*1000),
+       wv0/wv_ref, wc0/wc_ref, log10(sum(Ni)), mean(r_dry)/1e-6, mean(kappa)]
     """
     S0n  = ic["S0"]  / to_t(S_ref)
     T0n  = (ic["T0"] - to_t(T_ref)) / to_t(dT_ref)
@@ -212,7 +210,7 @@ def prepare_sample_tensors(x_np: np.ndarray, y0_np: np.ndarray, meta: Dict[str,A
         if kappas_np is None: kappas_np = np.full(n_bins, 0.54)
 
     # time / updraft normalization
-    V_val = infer_V_from_z_t(x_np, t_np)  # physical vertical velocity (units of z/t)
+    V_val = infer_V_from_z_t(x_np, t_np)
     t_all = torch.tensor(t_np, device=device, dtype=DTYPE).view(-1,1)
     t_ref = float(t_np[-1] - t_np[0]) if (t_np[-1] - t_np[0]) > 0 else 1.0
     t_nd_all = (t_all - t_all[0]) / to_t(t_ref)
@@ -262,7 +260,8 @@ def pinn_losses(model: nn.Module,
                 W_DATA: float,
                 cond_vec: Optional[torch.Tensor] = None,
                 data_t_nd: Optional[torch.Tensor] = None,
-                data_y: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                data_y: Optional[torch.Tensor] = None,
+                ic_auto_balance: bool = True) -> Dict[str, torch.Tensor]:
 
     cond = cond_vec.expand(t_nd.shape[0], -1) if cond_vec is not None else None
 
@@ -333,7 +332,7 @@ def pinn_losses(model: nn.Module,
     gamma = (P * Ma) / (Mw * pv_sat) + (Mw * L * L) / (Cp * R * T**2.0)
     dS_dt_phys = alpha * V_phys - gamma * dwc_dt_phys
 
-    # Auto-balancing weights
+    # Auto-balancing weights for physics residuals
     with torch.no_grad():
         def med(x): return torch.median(torch.abs(x)) + 1e-12
         w_r  = 1.0 / (med(dr_dt_phys) * med(dr_dt_full))
@@ -352,19 +351,38 @@ def pinn_losses(model: nn.Module,
          w_wv * torch.mean((dwv_dt - dwv_dt_phys)**2))
     )
 
-    # IC consistency at t*=0 (given ICs as inputs, output at t0 should equal ICs)
+    # IC consistency at t*=0
     t0_nd = torch.zeros_like(t_nd[:1])
     cond0 = cond_vec.expand(1, -1) if cond_vec is not None else None
     y0_hat = model(t0_nd, V_nd[:1], cond0)
     S0h, T0h, P0h = y0_hat[:,0:1], y0_hat[:,1:2], y0_hat[:,2:3]
     wv0h, wc0h    = y0_hat[:,3:4], y0_hat[:,4:5]
     r0h           = y0_hat[:,5:]
-    loss_ic = (torch.mean((S0h - ic["S0"])**2) +
-               torch.mean((T0h - ic["T0"])**2) +
-               torch.mean((P0h - ic["P0"])**2) +
-               torch.mean((wv0h - ic["wv0"])**2) +
-               torch.mean((wc0h - ic["wc0"])**2) +
-               torch.mean((r0h  - ic["r0s"])**2))
+
+    if ic_auto_balance:
+        with torch.no_grad():
+            def med(x): return torch.median(torch.abs(x)) + 1e-12
+            wS = 1.0 / med(ic["S0"])
+            wT = 1.0 / med(ic["T0"])
+            wP = 1.0 / med(ic["P0"])
+            wv = 1.0 / med(ic["wv0"])
+            wc = 1.0 / med(ic["wc0"])
+            wr = 1.0 / med(ic["r0s"])
+        loss_ic = (
+            wS*torch.mean((S0h - ic["S0"])**2) +
+            wT*torch.mean((T0h - ic["T0"])**2) +
+            wP*torch.mean((P0h - ic["P0"])**2) +
+            wv*torch.mean((wv0h - ic["wv0"])**2) +
+            wc*torch.mean((wc0h - ic["wc0"])**2) +
+            wr*torch.mean((r0h  - ic["r0s"])**2)
+        )
+    else:
+        loss_ic = (torch.mean((S0h - ic["S0"])**2) +
+                   torch.mean((T0h - ic["T0"])**2) +
+                   torch.mean((P0h - ic["P0"])**2) +
+                   torch.mean((wv0h - ic["wv0"])**2) +
+                   torch.mean((wc0h - ic["wc0"])**2) +
+                   torch.mean((r0h  - ic["r0s"])**2))
 
     # optional supervised loss (physical)
     loss_data = torch.tensor(0.0, dtype=DTYPE, device=y_hat.device)
@@ -383,6 +401,11 @@ def _get_device_from_env() -> torch.device:
     if torch.cuda.is_available():
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         torch.cuda.set_device(local_rank)
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+            torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+        except Exception:
+            pass
         return torch.device(f"cuda:{local_rank}")
     return torch.device("cpu")
 
@@ -405,8 +428,61 @@ def _cleanup_ddp():
             pass
         dist.destroy_process_group()
 
-def _manual_shard_indices(nsamples: int, world_size: int, rank: int):
-    return [i for i in range(nsamples) if (i % world_size) == rank]
+# ===============================
+# Epoch index builder (DDP-safe: equal steps/rank)
+# ===============================
+def _equal_split(indices: np.ndarray, world_size: int, rank: int) -> np.ndarray:
+    """
+    Split 'indices' into equal-size contiguous chunks across ranks.
+    Drops remainder to keep identical iteration counts per rank.
+    If len(indices) < world_size, repeat with replacement so every rank has work.
+    """
+    n = len(indices)
+    if n == 0:
+        return np.array([0], dtype=int)
+    per_rank = n // world_size
+    if per_rank == 0:
+        expanded = np.resize(indices, world_size)  # repeat as needed
+        return np.array([expanded[rank]], dtype=int)
+    n_eff = per_rank * world_size
+    indices = indices[:n_eff]
+    chunks = np.array_split(indices, world_size)
+    return chunks[rank]
+
+def _make_epoch_indices(nsamples: int,
+                        world_size: int,
+                        rank: int,
+                        rng: np.random.Generator,
+                        samples_per_epoch: Optional[int],
+                        reshuffle_across_ranks: bool) -> np.ndarray:
+    """
+    Return the indices THIS RANK should process for the current epoch.
+    """
+    if (samples_per_epoch is None) or (samples_per_epoch <= 0) or (samples_per_epoch >= nsamples):
+        base = np.arange(nsamples)
+        if reshuffle_across_ranks:
+            base = rng.permutation(base)
+        return _equal_split(base, world_size, rank)
+
+    K = int(min(samples_per_epoch, nsamples))
+    base = rng.permutation(nsamples) if reshuffle_across_ranks else np.arange(nsamples)
+    chosen = base[:K]
+    return _equal_split(chosen, world_size, rank)
+
+# ===============================
+# EMA helpers
+# ===============================
+def _init_ema(model: nn.Module) -> Dict[str, torch.Tensor]:
+    return {n: p.detach().clone() for n, p in model.module.named_parameters()}
+
+def _update_ema(ema: Dict[str, torch.Tensor], model: nn.Module, decay: float):
+    with torch.no_grad():
+        for n, p in model.module.named_parameters():
+            ema[n].mul_(decay).add_(p.detach(), alpha=1.0 - decay)
+
+def _state_dict_from_ema(ema: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    # move tensors to CPU for saving
+    return {n: t.detach().cpu() for n, t in ema.items()}
 
 # ===============================
 # Public entry from train_ddp.py
@@ -416,23 +492,32 @@ def ddp_train_entry(cfg: Dict[str, Any]):
     Called by each torchrun rank.
     Uses env:// rendezvous, sets device from LOCAL_RANK,
     trains, saves (rank0), and shuts down cleanly.
+
+    cfg keys this function uses:
+      npz_path, hidden, depth, lr, epochs, n_colloc,
+      W_PHYS, W_IC, W_DATA, accom_val,
+      samples_per_epoch, reshuffle_across_ranks,
+      print_every, model_out, preds_out,
+      ckpt_dir, save_every, resume_from, run_inference,
+      sup_points, edge_supervision_frac, ic_auto_balance,
+      use_scheduler, lr_factor, lr_patience, min_lr,
+      clip_grad_norm, ema_decay, use_ema_for_eval
     """
     device = _get_device_from_env()
     rank, world_size = _init_ddp()
 
-    # Optional: anomaly detector (debug)
     if cfg.get("detect_anomaly", False):
         torch.autograd.set_detect_anomaly(True)
 
     try:
-        # -------- Load data (replicated; small metadata) --------
+        # -------- Load data --------
         d = np.load(cfg["npz_path"], allow_pickle=True)
-        x_list   = d["x_list"]
-        y0_list  = d["y0_list"]
-        meta_list= d["meta_list"]
+        x_list    = d["x_list"]
+        y0_list   = d["y0_list"]
+        meta_list = d["meta_list"]
 
         nsamples = len(x_list)
-        assert nsamples > 0
+        assert nsamples > 0, "Empty dataset."
         n_bins0 = x_list[0].shape[1] - 7
         for k in range(nsamples):
             assert (x_list[k].shape[1] - 7) == n_bins0, "All samples must share same bin count."
@@ -440,8 +525,8 @@ def ddp_train_entry(cfg: Dict[str, Any]):
         # -------- Model / Opt --------
         cond_dim = 8
         model = PINNParcelNet(n_bins=n_bins0,
-                              hidden=cfg["hidden"],
-                              depth=cfg["depth"],
+                              hidden=int(cfg.get("hidden", 256)),
+                              depth=int(cfg.get("depth", 5)),
                               cond_dim=cond_dim).to(device=device, dtype=DTYPE)
 
         model = DDP(model,
@@ -449,42 +534,118 @@ def ddp_train_entry(cfg: Dict[str, Any]):
                     broadcast_buffers=False,
                     find_unused_parameters=False)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+        optimizer = torch.optim.Adam(model.parameters(), lr=float(cfg.get("lr", 3e-4)))
 
-        W_PHYS = float(cfg["W_PHYS"]); W_IC = float(cfg["W_IC"]); W_DATA = float(cfg["W_DATA"])
+        # optional scheduler
+        use_scheduler   = bool(cfg.get("use_scheduler", 1))
+        lr_factor       = float(cfg.get("lr_factor", 0.5))
+        lr_patience     = int(cfg.get("lr_patience", 6))
+        min_lr          = float(cfg.get("min_lr", 1e-7))
+        scheduler = None
+        if use_scheduler:
+            scheduler = ReduceLROnPlateau(optimizer, factor=lr_factor, patience=lr_patience,
+                                          min_lr=min_lr, verbose=(rank==0))
 
-        # -------- Shard samples across ranks --------
-        shard = _manual_shard_indices(nsamples, world_size, rank)
+        # loss weights
+        W_PHYS = float(cfg.get("W_PHYS", 1.0))
+        W_IC   = float(cfg.get("W_IC",   1.0))
+        W_DATA = float(cfg.get("W_DATA", 0.1))
+        ic_auto_balance = bool(cfg.get("ic_auto_balance", True))
+
+        # EMA
+        ema_decay = float(cfg.get("ema_decay", 0.999))
+        use_ema_for_eval = bool(cfg.get("use_ema_for_eval", 1))
+        ema = _init_ema(model)
+
+        # ----- Resume (weights only) -----
+        resume_path = cfg.get("resume_from", None)
+        if not resume_path:
+            # auto-detect last.pt if present
+            ckpt_dir_default = cfg.get("ckpt_dir", "checkpoints")
+            candidate = os.path.join(ckpt_dir_default, "last.pt")
+            if os.path.isfile(candidate):
+                resume_path = candidate
+        if resume_path and os.path.isfile(resume_path):
+            map_location = device if device.type == "cpu" else {"cuda:0": f"cuda:{device.index}"}
+            try:
+                state = torch.load(resume_path, map_location=map_location)
+                missing, unexpected = model.module.load_state_dict(state, strict=False)
+                if rank == 0:
+                    print(f"[rank0] Resumed from {resume_path} "
+                          f"(missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
+                # sync EMA to current model on resume
+                ema = _init_ema(model)
+            except Exception as e:
+                if rank == 0:
+                    print(f"[rank0] WARNING: failed to resume from {resume_path}: {e}", flush=True)
 
         # -------- Train --------
-        for ep in range(1, int(cfg["epochs"])+1):
+        samples_per_epoch_cfg = int(cfg.get("samples_per_epoch", 0)) or None
+        reshuffle = bool(cfg.get("reshuffle_across_ranks", True))
+        print_every = int(cfg.get("print_every", 10))
+        ckpt_dir = cfg.get("ckpt_dir", "checkpoints")
+        save_every = int(cfg.get("save_every", 0))  # 0 => skip named epoch saves, but still write last.pt
+        clip_val = float(cfg.get("clip_grad_norm", 0.5))  # tighter than 1.0
+        sup_points = int(cfg.get("sup_points", 64))
+        edge_frac = float(cfg.get("edge_supervision_frac", 0.25))
+
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        total_epochs = int(cfg.get("epochs", 100))
+        for ep in range(1, total_epochs + 1):
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             t0 = time.perf_counter()
 
             rng = np.random.default_rng(seed=ep + rank*17)
-            order = rng.permutation(shard)
+            order = _make_epoch_indices(
+                nsamples=nsamples,
+                world_size=world_size,
+                rank=rank,
+                rng=rng,
+                samples_per_epoch=samples_per_epoch_cfg,
+                reshuffle_across_ranks=reshuffle
+            )
+            rng.shuffle(order)  # local shuffle
 
             epoch_tot = epoch_phys = epoch_ic = epoch_data = 0.0
+            seen = 0
+
             for k in order:
                 x_np = x_list[k]; y0_np = y0_list[k]
                 meta = extract_meta(meta_list[k])
                 ic, consts, t_nd_all, y_data, V_nd_all, n_bins, cond_vec = prepare_sample_tensors(
-                    x_np, y0_np, meta, cfg["accom_val"], device
+                    x_np, y0_np, meta, float(cfg.get("accom_val", 0.3)), device
                 )
 
                 # collocation points (requires_grad for autograd)
-                t_nd = torch.rand((cfg["n_colloc"],1), device=device, dtype=DTYPE, requires_grad=True)
+                t_nd = torch.rand((int(cfg.get("n_colloc", 64)),1), device=device, dtype=DTYPE, requires_grad=True)
                 V_nd = torch.full_like(t_nd, fill_value=V_nd_all[0].item(), dtype=DTYPE, device=device)
 
-                # supervised subsample (physical)
-                idx = torch.randperm(t_nd_all.shape[0], device=device)[:min(64, t_nd_all.shape[0])]
+                # supervised subsample (physical) with edge bias
+                n_all = t_nd_all.shape[0]
+                sp = min(sup_points, n_all)
+                n_edge = min(int(sp * edge_frac), n_all // 2)
+                if n_edge > 0:
+                    left = torch.arange(n_edge, device=device)
+                    right = torch.arange(n_all - n_edge, n_all, device=device)
+                    mask = torch.ones(n_all, dtype=torch.bool, device=device)
+                    mask[left] = False; mask[right] = False
+                    rest_candidates = torch.arange(n_all, device=device)[mask]
+                    if rest_candidates.numel() > 0 and (sp - 2*n_edge) > 0:
+                        rest = rest_candidates[torch.randperm(rest_candidates.numel(), device=device)[:(sp - 2*n_edge)]]
+                        idx = torch.cat([left, right, rest])
+                    else:
+                        idx = torch.cat([left, right])
+                else:
+                    idx = torch.randperm(n_all, device=device)[:sp]
+
                 data_t_nd = t_nd_all[idx].detach().to(dtype=DTYPE)
                 data_y    = y_data[idx].detach().to(dtype=DTYPE)
 
                 t_ref = float(consts["t_ref"].item())
 
-                # basic sanity (helps catch NaNs early)
+                # sanity
                 assert torch.isfinite(t_nd).all() and torch.isfinite(V_nd).all()
                 assert torch.isfinite(data_t_nd).all() and torch.isfinite(data_y).all()
 
@@ -493,18 +654,23 @@ def ddp_train_entry(cfg: Dict[str, Any]):
                 losses = pinn_losses(model, t_nd, V_nd, t_ref, consts, ic,
                                      W_PHYS, W_IC, W_DATA,
                                      cond_vec=cond_vec,
-                                     data_t_nd=data_t_nd, data_y=data_y)
+                                     data_t_nd=data_t_nd, data_y=data_y,
+                                     ic_auto_balance=ic_auto_balance)
                 losses["total"].backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
                 optimizer.step()
+
+                # EMA update
+                _update_ema(ema, model, ema_decay)
 
                 epoch_tot  += float(losses["total"].item())
                 epoch_phys += float(losses["phys"].item())
                 epoch_ic   += float(losses["ic"].item())
                 epoch_data += float(losses["data"].item())
+                seen += 1
 
-            # average metrics across ranks
-            metrics = torch.tensor([epoch_tot, epoch_phys, epoch_ic, epoch_data, float(len(shard))],
+            # average metrics across ranks; include actual 'seen' count
+            metrics = torch.tensor([epoch_tot, epoch_phys, epoch_ic, epoch_data, float(seen)],
                                    dtype=DTYPE, device=device)
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
 
@@ -515,28 +681,79 @@ def ddp_train_entry(cfg: Dict[str, Any]):
             dist.all_reduce(epoch_sec, op=dist.ReduceOp.MAX)   # slowest rank
             secs_per_epoch = float(epoch_sec.item())
 
-            if rank == 0 and ((ep % int(cfg["print_every"]) == 0) or ep == 1):
-                tot, phys, icc, data, count = metrics.tolist()
-                m = max(count, 1.0)
-                eta_hours = (int(cfg["epochs"]) - ep) * secs_per_epoch / 3600.0
-                print(f"[epoch {ep:4d}/{cfg['epochs']}] "
+            # compute global averages for logging & scheduler
+            tot, phys, icc, data, count = metrics.tolist()
+            m = max(count, 1.0)  # total samples processed globally this epoch
+            avg_total = tot / m
+
+            # scheduler step (same value on all ranks)
+            if scheduler is not None:
+                scheduler.step(avg_total)
+
+            if rank == 0 and ((ep % print_every == 0) or ep == 1):
+                eta_hours = (total_epochs - ep) * secs_per_epoch / 3600.0
+                print(f"[epoch {ep:4d}/{total_epochs}] "
                       f"total={tot/m:.3e} phys={phys/m:.3e} ic={icc/m:.3e} data={data/m:.3e} | "
-                      f"time/epoch={secs_per_epoch:.2f}s  ETA~{eta_hours:.2f}h",
+                      f"samples/epoch={int(count)} | time/epoch={secs_per_epoch:.2f}s  ETA~{eta_hours:.2f}h",
                       flush=True)
 
-        # -------- Save + inference on rank0 --------
+            # --- Save checkpoints at end of epoch (rank 0) ---
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+
+            if rank == 0:
+                # periodic named checkpoint (raw weights)
+                if save_every > 0 and (ep % save_every == 0):
+                    ckpt_path = os.path.join(ckpt_dir, f"pinn_epoch_{ep:04d}.pt")
+                    torch.save(model.module.state_dict(), ckpt_path)
+                    # also store EMA snapshot
+                    ckpt_ema_path = os.path.join(ckpt_dir, f"pinn_epoch_{ep:04d}_ema.pt")
+                    torch.save(_state_dict_from_ema(ema), ckpt_ema_path)
+
+                # rolling last.pt (raw) and last_ema.pt (EMA)
+                last_path = os.path.join(ckpt_dir, "last.pt")
+                tmp_path = last_path + ".tmp"
+                torch.save(model.module.state_dict(), tmp_path)
+                os.replace(tmp_path, last_path)
+
+                last_ema_path = os.path.join(ckpt_dir, "last_ema.pt")
+                tmp_ema = last_ema_path + ".tmp"
+                torch.save(_state_dict_from_ema(ema), tmp_ema)
+                os.replace(tmp_ema, last_ema_path)
+
+        # -------- Save final + optional inference on rank0 --------
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+
         if rank == 0:
-            torch.save(model.module.state_dict(), cfg["model_out"])
+            # choose which weights to export as "model_out"
+            if use_ema_for_eval:
+                torch.save(_state_dict_from_ema(ema), cfg["model_out"])
+            else:
+                torch.save(model.module.state_dict(), cfg["model_out"])
             print(f"[rank0] saved model to {cfg['model_out']}", flush=True)
 
+        run_inf = int(cfg.get("run_inference", 1))
+        if rank == 0 and run_inf:
             print("[rank0] running inference on all samples…", flush=True)
             S_all, T_all, P_all, wv_all, wc_all, r_all, t_all, V_list = [], [], [], [], [], [], [], []
             model.eval()
+
+            # if using EMA for eval, create a shadow copy of params for inference
+            if use_ema_for_eval:
+                with torch.no_grad():
+                    for n, p in model.module.named_parameters():
+                        p.data.copy_(ema[n])
+
             with torch.no_grad():
                 for k in range(nsamples):
                     x_np = x_list[k]; y0_np = y0_list[k]; meta = extract_meta(meta_list[k])
                     ic, consts, t_nd_all, _, V_nd_all, n_bins, cond_vec = prepare_sample_tensors(
-                        x_np, y0_np, meta, cfg["accom_val"], device
+                        x_np, y0_np, meta, float(cfg.get("accom_val", 0.3)), device
                     )
                     cond_inf = cond_vec.expand(t_nd_all.shape[0], -1)
                     y_pred = model(t_nd_all.to(dtype=DTYPE), V_nd_all.to(dtype=DTYPE), cond_inf).cpu().numpy()
@@ -560,4 +777,3 @@ def ddp_train_entry(cfg: Dict[str, Any]):
 
     finally:
         _cleanup_ddp()
-
